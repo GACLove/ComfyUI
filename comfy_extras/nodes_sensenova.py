@@ -25,7 +25,9 @@ from comfy.ldm.sensenova.interleave import (
     prefix_arguments,
 )
 from comfy.ldm.sensenova.model import HEAD_DIM, NUM_KV_HEADS, NUM_LAYERS
-from comfy.ldm.sensenova.sampling import SenseNovaModelSampling
+from comfy.ldm.sensenova.sampling import SenseNovaModelSampling, upstream_sigmas
+from comfy.ldm.sensenova.inference_alignment import U1AlignedModelSampling, apply_u1_inference_alignment
+from comfy.ldm.sensenova.sampling_alignment import U1AlignedNoise, bf16_velocity_cfg, sample_bf16_euler
 from comfy_api.latest import ComfyExtension, io, ui
 from comfy_execution.graph_utils import ExecutionBlocker
 
@@ -65,6 +67,56 @@ class ModelSamplingSenseNova(io.ComfyNode):
         model_sampling.set_parameters(shift=shift)
         patched.add_object_patch("model_sampling", model_sampling)
         return io.NodeOutput(patched)
+
+
+class SenseNovaU1InferenceAlignment(io.ComfyNode):
+    """Match the SenseNova-U1 repository's model execution and BF16 sampling."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SenseNovaU1InferenceAlignment",
+            display_name="SenseNova-U1 Inference Alignment",
+            category="model/sampling/sensenova",
+            description="Match the SenseNova-U1 repository's BF16 model computation and sampling for reproducibility comparisons. Connect MODEL to both Generate SenseNova Text and CFGGuider; connect NOISE, SAMPLER and SIGMAS to SamplerCustomAdvanced. Keep the same seed for every interleave iteration. Exact pixels also require matching inputs, settings, device and attention backend.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Int.Input("noise_seed", default=42, min=0, max=0xffffffffffffffff, control_after_generate=True),
+                io.Conditioning.Input("conditioning", optional=True,
+                                      tooltip="Connect the same incoming history as Generate SenseNova Text, before this iteration's text generation."),
+                io.Int.Input("steps", default=50, min=1, optional=True),
+                io.Float.Input("shift", default=3.0, step=0.01, optional=True),
+                io.Latent.Input("samples", optional=True,
+                                tooltip="Previous iteration's generated samples, also connected to Generate SenseNova Text. Omit on the first iteration."),
+            ],
+            outputs=[io.Model.Output(), io.Noise.Output(), io.Sampler.Output(), io.Sigmas.Output()],
+        )
+
+    @classmethod
+    def validate_inputs(cls, shift=3.0):
+        return ModelSamplingSenseNova.validate_inputs(shift)
+
+    @classmethod
+    def execute(cls, model, noise_seed, conditioning=None, steps=50, shift=3.0, samples=None):
+        """Return U1-aligned model and sampling inputs, replaying noise past generated history."""
+        validation = cls.validate_inputs(shift)
+        if validation is not True:
+            raise ValueError(validation)
+        metadata = conditioning[0][1] if conditioning else {}
+        references = metadata.get("reference_latents") or []
+        input_images = metadata.get("sensenova_interleave_input_images", len(references))
+        previous_sizes = [tuple(image.shape[-3:-1]) for image in references[input_images:]]
+        if samples is not None:
+            previous_sizes.append(tuple(samples["samples"].shape[-2:]))
+        patched = model.clone()
+        sampling = U1AlignedModelSampling(patched.model.model_config)
+        sampling.set_parameters(shift=shift)
+        patched.add_object_patch("model_sampling", sampling)
+        apply_u1_inference_alignment(patched)
+        patched.set_model_sampler_cfg_function(bf16_velocity_cfg)
+        noise = U1AlignedNoise(noise_seed, model.load_device, previous_sizes, sampling.noise_scale)
+        sigmas = upstream_sigmas(steps, sampling.shift, device=model.load_device)
+        return io.NodeOutput(patched, noise, comfy.samplers.KSAMPLER(sample_bf16_euler), sigmas)
 
 
 class TextGenerateSenseNova(io.ComfyNode):
@@ -524,6 +576,7 @@ class SenseNovaExtension(ComfyExtension):
         return [
             TextGenerateSenseNova,
             ModelSamplingSenseNova,
+            SenseNovaU1InferenceAlignment,
             SenseNovaInterleaveDecode,
         ]
 
