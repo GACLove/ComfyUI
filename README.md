@@ -1,3 +1,5 @@
+> **SenseNova-U1 alignment snapshot (frozen).** This branch preserves the verified inference-alignment baseline. See the [freeze notes](SENSENOVA_ALIGNMENT_FREEZE.md) for runtime settings, validation scope, and limitations.
+
 <div align="center">
 
 # ComfyUI
